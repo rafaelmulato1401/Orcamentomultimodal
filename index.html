@@ -6,6 +6,29 @@
 <title>Dashboard Orçamentário — Filiais</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script type="module">
+// ── FIREBASE INIT ──
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getFirestore, doc, getDoc, setDoc, deleteDoc, collection, getDocs, writeBatch }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBXOwPjIsr1kd7LV0T0gb4nVwPBCxzUllY",
+  authDomain: "orcamentomultimodal.firebaseapp.com",
+  projectId: "orcamentomultimodal",
+  storageBucket: "orcamentomultimodal.firebasestorage.app",
+  messagingSenderId: "766713232213",
+  appId: "1:766713232213:web:d71f4da2a8ff70c239cddc"
+};
+
+const fbApp = initializeApp(firebaseConfig);
+const db_fs = getFirestore(fbApp);
+
+// Expose Firebase helpers to global scope for use in the main script
+window._fb = { db_fs, doc, getDoc, setDoc, deleteDoc, collection, getDocs, writeBatch };
+window._fbReady = true;
+window.dispatchEvent(new Event('fbReady'));
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@300;400;500;600;700;800&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 /* ── PALETA AZUL MARINHO + DOURADO (padrão Inpasa) ── */
@@ -323,13 +346,159 @@ td:first-child,td:nth-child(2){text-align:left;color:var(--text2);}
 
 <script>
 // ══════════ STATE ══════════
-const SK='orcamento_inpasa_v1';
 let DB={}, OBS={};
 let chartD=null, chartP=null, chartDev=null;
+let _fbSaveTimer=null;
 
-function loadDB(){ try{const s=localStorage.getItem(SK);if(s){const p=JSON.parse(s);DB=p.DB||{};OBS=p.OBS||{};}}catch(e){} }
-function saveDB(){ try{localStorage.setItem(SK,JSON.stringify({DB,OBS}));}catch(e){} }
-loadDB();
+// ── Firebase helpers (set after fbReady event) ──
+let _fb=null;
+
+function showLoader(msg){
+  let el=document.getElementById('fb-loader');
+  if(!el){
+    el=document.createElement('div');
+    el.id='fb-loader';
+    el.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(13,32,68,.82);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9000;font-family:Barlow Condensed,sans-serif;color:#fff;gap:16px;';
+    el.innerHTML=`<div style="width:40px;height:40px;border:3px solid rgba(255,255,255,.2);border-top-color:#f0a500;border-radius:50%;animation:spin .7s linear infinite"></div><div id="fb-loader-msg" style="font-size:16px;font-weight:600;letter-spacing:.5px;">${msg||'Carregando...'}</div>`;
+    document.body.appendChild(el);
+    if(!document.getElementById('spin-style')){
+      const s=document.createElement('style');s.id='spin-style';
+      s.textContent='@keyframes spin{to{transform:rotate(360deg)}}';
+      document.head.appendChild(s);
+    }
+  } else { document.getElementById('fb-loader-msg').textContent=msg||'Carregando...'; }
+}
+function hideLoader(){ const el=document.getElementById('fb-loader');if(el)el.remove(); }
+
+async function loadDB(){
+  if(!_fb){return;}
+  showLoader('Carregando dados do servidor...');
+  try{
+    const branches=await _fb.getDocs(_fb.collection(_fb.db_fs,'filiais'));
+    branches.forEach(d=>{ if(d.id!=='__obs__') DB[d.id]=d.data().data; });
+    const obsDoc=await _fb.getDoc(_fb.doc(_fb.db_fs,'config','obs'));
+    if(obsDoc.exists()) OBS=obsDoc.data().obs||{};
+  }catch(e){ console.error('Erro ao carregar Firebase:',e); showToast('Erro ao carregar dados: '+e.message); }
+  finally{ hideLoader(); }
+}
+
+// ── saveBranch: safe merge — never deletes existing rows or obs ──
+// Logic:
+//   1. Load current Firestore doc for this branch (fresh read)
+//   2. Build a map of existing rows keyed by grupoCod+empCod
+//   3. For each row in the new CSV: update existing or add new (never remove old rows)
+//   4. Union of months (old + new)
+//   5. Write back — OBS is NEVER touched here
+async function saveBranch(branchName){
+  if(!_fb) return;
+  showLoader('Salvando '+branchName+'...');
+  try{
+    const ref=_fb.doc(_fb.db_fs,'filiais',branchName);
+    // 1. Read current state from Firestore
+    const snap=await _fb.getDoc(ref);
+    const existing=snap.exists()?snap.data().data:null;
+
+    const incoming=DB[branchName]; // freshly parsed from CSV
+
+    let mergedRows;
+    let mergedMonths;
+
+    if(!existing){
+      // Brand new branch — just save as-is
+      mergedRows=incoming.rows;
+      mergedMonths=incoming.months;
+    } else {
+      // Build index of existing rows: key = grupoCod|empCod
+      const existingIdx={};
+      (existing.rows||[]).forEach(r=>{
+        existingIdx[r.grupoCod+'|'+r.empCod]=r;
+      });
+
+      // Build index of incoming rows
+      const incomingIdx={};
+      incoming.rows.forEach(r=>{
+        incomingIdx[r.grupoCod+'|'+r.empCod]=r;
+      });
+
+      // Merge months: union, preserving order (existing first, then new ones)
+      const monthSet=new Set([...(existing.months||[]),...incoming.months]);
+      // Keep logical calendar order from incoming (it defines the year structure)
+      // Re-sort by position in incoming.months if present, then existing
+      const allKnownMonths=[...incoming.months];
+      (existing.months||[]).forEach(m=>{ if(!allKnownMonths.includes(m)) allKnownMonths.push(m); });
+      mergedMonths=allKnownMonths;
+
+      // Merge rows: for each existing row, update monthData only for months present in incoming
+      const mergedIdx={};
+
+      // Start with all existing rows
+      (existing.rows||[]).forEach(r=>{
+        mergedIdx[r.grupoCod+'|'+r.empCod]=JSON.parse(JSON.stringify(r));
+      });
+
+      // Apply incoming rows: update matching rows month by month, add new rows
+      incoming.rows.forEach(inRow=>{
+        const key=inRow.grupoCod+'|'+inRow.empCod;
+        if(mergedIdx[key]){
+          // Row exists — update ONLY the months present in this new CSV
+          incoming.months.forEach(m=>{
+            mergedIdx[key].monthData[m]=inRow.monthData[m];
+          });
+          // Also update descriptive fields in case they changed
+          mergedIdx[key].grupoNome=inRow.grupoNome;
+          mergedIdx[key].empNome=inRow.empNome;
+        } else {
+          // New row not previously in DB — add it
+          mergedIdx[key]=JSON.parse(JSON.stringify(inRow));
+        }
+      });
+
+      mergedRows=Object.values(mergedIdx);
+    }
+
+    // Write merged data back (OBS is in a separate Firestore document — untouched)
+    const mergedData={rows:mergedRows, months:mergedMonths};
+    await _fb.setDoc(ref,{data:mergedData, updatedAt:new Date().toISOString()});
+
+    // Update in-memory DB with merged result
+    DB[branchName]=mergedData;
+
+  }catch(e){ console.error('Erro ao salvar filial:',e); showToast('Erro ao salvar: '+e.message); }
+  finally{ hideLoader(); }
+}
+
+// ── saveObs: only writes the OBS document — never touches branch data ──
+let _obsSaveTimer=null;
+async function saveObs(){
+  if(!_fb) return;
+  clearTimeout(_obsSaveTimer);
+  _obsSaveTimer=setTimeout(async()=>{
+    try{
+      await _fb.setDoc(_fb.doc(_fb.db_fs,'config','obs'),{obs:OBS, updatedAt:new Date().toISOString()});
+    }catch(e){ console.error('Erro ao salvar obs:',e); showToast('Erro ao salvar observação: '+e.message); }
+  },600);
+}
+
+// ── saveDB: legacy alias — now only saves OBS (branch saves go through saveBranch) ──
+async function saveDB(){ await saveObs(); }
+
+async function deleteBranchFromDB(name){
+  if(!_fb)return;
+  try{ await _fb.deleteDoc(_fb.doc(_fb.db_fs,'filiais',name)); }
+  catch(e){ console.error('Erro ao deletar:',e); }
+}
+
+// Init: wait for Firebase then load data
+function initApp(){
+  _fb=window._fb;
+  loadDB().then(()=>{
+    if(hasBranches()){populateFilters();renderDashboard();renderImport();}
+    else{renderImport();}
+  });
+}
+
+if(window._fbReady){ initApp(); }
+else{ window.addEventListener('fbReady',initApp); }
 
 // ══════════ TABS ══════════
 function switchTab(t){
@@ -353,10 +522,13 @@ function handleFiles(files){
   Array.from(files).forEach(f=>{
     const branch=f.name.replace(/\.csv$/i,'').trim();
     Papa.parse(f,{header:true,skipEmptyLines:true,delimiter:';',encoding:'latin1',
-      complete:r=>{
+      complete:async r=>{
+        // Parse incoming CSV
         DB[branch]=parseCSV(r.data);
-        saveDB(); populateFilters(); renderImport();
-        showToast(`✓ ${branch} — ${DB[branch].rows.length} itens carregados`);
+        // Safe merge: updates only rows/months present in this file, preserves rest
+        await saveBranch(branch);
+        populateFilters(); renderImport();
+        showToast(`✓ ${branch} — ${DB[branch].rows.length} itens (merge seguro)`);
       }
     });
   });
@@ -704,7 +876,7 @@ function saveObs(obsKey,brKey,gCod,eCod,months,e){
     const el=document.getElementById(`ot_${obsKey}_${m.replace(/\//g,'_')}`);
     if(el){const key=eKey+'__'+m;const v=el.value.trim();if(v)OBS[brKey][key]=v;else delete OBS[brKey][key];}
   });
-  saveDB();
+  saveObs();
   const el=document.getElementById('osv_'+obsKey);
   if(el){el.style.display='inline';setTimeout(()=>el.style.display='none',2200);}
   showToast('Observações salvas com sucesso!');
@@ -968,16 +1140,25 @@ function renderImport(){
 
 function deleteBranch(b){
   if(!confirm(`Remover todos os dados de "${b}"?`))return;
-  delete DB[b];delete OBS[b];saveDB();renderImport();populateFilters();showToast('Dados removidos: '+b);
+  delete DB[b];
+  // Clean OBS entries for this branch
+  Object.keys(OBS).forEach(k=>{ if(k.startsWith(b+'__')) delete OBS[k]; });
+  deleteBranchFromDB(b);
+  saveObs(); // save cleaned OBS
+  renderImport();populateFilters();showToast('Dados removidos: '+b);
 }
 
-function clearMonth(){
+async function clearMonth(){
   const b=document.getElementById('cl-filial').value;
   const m=document.getElementById('cl-mes').value;
   if(!b||!m||m===''){showToast('Selecione filial e mês!');return;}
   if(!confirm(`Limpar dados de "${m}" da filial "${b}"?`))return;
   DB[b].rows.forEach(r=>{if(r.monthData[m])r.monthData[m]={orcado:0,realizado:0,percentual:0,diferenca:0};});
-  saveDB();showToast(`Mês ${m} limpo — ${b}`);
+  // Save only this branch directly (safe — no merge needed for a clear)
+  if(_fb){
+    await _fb.setDoc(_fb.doc(_fb.db_fs,'filiais',b),{data:DB[b],updatedAt:new Date().toISOString()});
+  }
+  showToast(`Mês ${m} limpo — ${b}`);
 }
 
 function clearBranch(){
@@ -995,8 +1176,7 @@ function showToast(msg){
   t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2800);
 }
 
-// ══════════ INIT ══════════
-if(hasBranches()){populateFilters();renderDashboard();renderImport();}else{renderImport();}
+// ══════════ INIT (handled by initApp after fbReady) ══════════
 </script>
 </body>
 </html>

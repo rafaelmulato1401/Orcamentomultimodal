@@ -467,9 +467,9 @@ async function saveBranch(branchName){
   finally{ hideLoader(); }
 }
 
-// ── saveObs: only writes the OBS document — never touches branch data ──
+// ── saveObsToFirebase: only writes the OBS document — never touches branch data ──
 let _obsSaveTimer=null;
-async function saveObs(){
+async function saveObsToFirebase(){
   if(!_fb) return;
   clearTimeout(_obsSaveTimer);
   _obsSaveTimer=setTimeout(async()=>{
@@ -479,8 +479,8 @@ async function saveObs(){
   },600);
 }
 
-// ── saveDB: legacy alias — now only saves OBS (branch saves go through saveBranch) ──
-async function saveDB(){ await saveObs(); }
+// ── saveDB: legacy alias ──
+async function saveDB(){ await saveObsToFirebase(); }
 
 async function deleteBranchFromDB(name){
   if(!_fb)return;
@@ -765,7 +765,10 @@ function renderDTable(rowArr,mAll,selMes,branch,visao){
 
   let bHtml='',gTotO=0,gTotR=0;
 
-  Object.values(groupMap).forEach(g=>{
+  // Sort groups ascending by numeric group code
+  const sortedGroups=Object.values(groupMap).sort((a,b)=>(parseInt(a.cod)||0)-(parseInt(b.cod)||0)||a.cod.localeCompare(b.cod));
+
+  sortedGroups.forEach(g=>{
     const gId='gid'+g.cod.replace(/\W/g,'_');
     let gO=0,gR=0,gOa=0,gRa=0;
     g.items.forEach(row=>{
@@ -876,7 +879,7 @@ function saveObs(obsKey,brKey,gCod,eCod,months,e){
     const el=document.getElementById(`ot_${obsKey}_${m.replace(/\//g,'_')}`);
     if(el){const key=eKey+'__'+m;const v=el.value.trim();if(v)OBS[brKey][key]=v;else delete OBS[brKey][key];}
   });
-  saveObs();
+  saveObsToFirebase();
   const el=document.getElementById('osv_'+obsKey);
   if(el){el.style.display='inline';setTimeout(()=>el.style.display='none',2200);}
   showToast('Observações salvas com sucesso!');
@@ -1040,6 +1043,9 @@ function renderGTree(groups,totO,totR,totD,totP,selMes,mAll,gVisao,branch){
     <td class="${totD>=0?'pos':'neg'}">${fR(totD)}</td>
     <td>${pctBadge(totP)}</td></tr>`;
 
+  // Sort groups ascending by numeric group code
+  groups.sort((a,b)=>parseInt(a.cod)||0 - parseInt(b.cod)||0 || a.cod.localeCompare(b.cod));
+
   groups.forEach(g=>{
     const gId='gg'+g.cod.replace(/\W/g,'_');
     const gD=g.o-g.r,gP=g.o>0?(g.r/g.o*100):0;
@@ -1144,7 +1150,7 @@ function deleteBranch(b){
   // Clean OBS entries for this branch
   Object.keys(OBS).forEach(k=>{ if(k.startsWith(b+'__')) delete OBS[k]; });
   deleteBranchFromDB(b);
-  saveObs(); // save cleaned OBS
+  saveObsToFirebase(); // save cleaned OBS
   renderImport();populateFilters();showToast('Dados removidos: '+b);
 }
 
